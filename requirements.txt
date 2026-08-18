@@ -1,0 +1,6 @@
+gradio
+anthropic
+python-dotenv
+numpy
+imageio-ffmpeg
+yt-dlp
