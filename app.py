@@ -42,6 +42,13 @@ GLOSSARY = BASE / "словарь.csv"
 HISTORY = BASE / "история.csv"
 COOKIES = BASE / "cookies.txt"
 
+# куки из переменной окружения (Render) -> файл при старте
+if os.environ.get("COOKIES_TXT"):
+    try:
+        COOKIES.write_text(os.environ["COOKIES_TXT"], encoding="utf-8")
+    except Exception:
+        pass
+
 claude = anthropic.Anthropic()
 
 
