@@ -141,8 +141,8 @@ TRANSLATE_SYSTEM = """Ты переводчик религиозных выст�
      если их нет в оригинале;
    - выбирай слово той же силы: «жаман көрүп калуу» = «плохо подумать/невзлюбить»,
      а не «возненавидеть». Не драматизируй и не смягчай.
-9. Ремарки о зале ([журт күлөт], [журттун сүйлөөсү] и т.п.) переводи и сохраняй все:
-   [смех в зале], [голоса из зала] — не выбрасывай ни одной.
+9. Реакции зала и звуковые ремарки ([журт күлөт], (laughter), [смех] и т.п.)
+   в перевод НЕ включай — опускай полностью, переводи только речь устаза.
 10. Культурные слова без точного русского аналога (төр, той и т.п.) оставляй
     с кратким пояснением при первом упоминании: «төр (почётное место в доме)».
 11. Верни ТОЛЬКО перевод, без вступлений и комментариев.
@@ -197,7 +197,7 @@ def transcribe_cloud(audio_path: Path) -> str:
         return (f"--{boundary}\r\nContent-Disposition: form-data; "
                 f"name=\"{name}\"\r\n\r\n{value}\r\n").encode()
 
-    body = part("model_id", "scribe_v1") + part("language_code", "ky")
+    body = part("model_id", "scribe_v1") + part("language_code", "ky") + part("tag_audio_events", "false")
     body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
              f"filename=\"{audio_path.name}\"\r\nContent-Type: application/octet-stream"
              f"\r\n\r\n").encode() + data + b"\r\n" + f"--{boundary}--\r\n".encode()
