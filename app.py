@@ -45,7 +45,19 @@ COOKIES = BASE / "cookies.txt"
 # куки из переменной окружения (Render) -> файл при старте
 if os.environ.get("COOKIES_TXT"):
     try:
-        COOKIES.write_text(os.environ["COOKIES_TXT"], encoding="utf-8")
+        lines = []
+        for line in os.environ["COOKIES_TXT"].splitlines():
+            line = line.strip()
+            # при копипасте табы часто превращаются в пробелы — чиним:
+            # netscape-формат требует ровно 7 полей через таб
+            if line and not line.startswith("#"):
+                parts = line.split()
+                if len(parts) >= 7:
+                    line = "	".join(parts[:6] + [" ".join(parts[6:])])
+            lines.append(line)
+        COOKIES.write_text("
+".join(lines) + "
+", encoding="utf-8")
     except Exception:
         pass
 
