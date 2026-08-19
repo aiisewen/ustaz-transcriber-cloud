@@ -53,11 +53,9 @@ if os.environ.get("COOKIES_TXT"):
             if line and not line.startswith("#"):
                 parts = line.split()
                 if len(parts) >= 7:
-                    line = "	".join(parts[:6] + [" ".join(parts[6:])])
+                    line = "\t".join(parts[:6] + [" ".join(parts[6:])])
             lines.append(line)
-        COOKIES.write_text("
-".join(lines) + "
-", encoding="utf-8")
+        COOKIES.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception:
         pass
 
