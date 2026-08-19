@@ -336,22 +336,22 @@ def retranslate(ky_text):
     return ru, "Перевод обновлён ✅"
 
 
-def latest_results():
-    """Последний транскрипт + перевод — чтобы не пропадали при обновлении страницы."""
-    try:
-        files = sorted(DIR_TRANSCRIPTS.glob("*.txt"), key=lambda p: p.stat().st_mtime)
-        if not files:
-            return "", "", ""
-        t = files[-1]
-        ky = t.read_text(encoding="utf-8")
-        # срезать служебную шапку, если есть
-        if ky.startswith("#"):
-            ky = "\n".join(l for l in ky.splitlines() if not l.startswith("#")).strip()
-        ru_path = DIR_TRANSLATIONS / f"{t.stem}_ru.txt"
-        ru = ru_path.read_text(encoding="utf-8") if ru_path.exists() else ""
-        return ky, ru, f"↺ Загружен последний результат: {t.name}"
-    except Exception:
-        return "", "", ""
+def process_store(file_path, url, model_key, do_translate, do_clean=False, progress=gr.Progress()):
+    ky, ru, status = process(file_path, url, model_key, do_translate, do_clean, progress)
+    return ky, ru, status, {"ky": ky, "ru": ru}
+
+
+def retranslate_store(ky_text):
+    ru, status = retranslate(ky_text)
+    return ru, status, {"ky": ky_text, "ru": ru}
+
+
+def restore_short(store):
+    """Результат живёт в браузере: после обновления — на месте, у нового посетителя пусто."""
+    store = store or {}
+    ky, ru = store.get("ky", ""), store.get("ru", "")
+    status = "↺ Восстановлено после обновления страницы" if (ky or ru) else ""
+    return ky, ru, status
 
 
 def load_history_rows():
@@ -421,11 +421,12 @@ with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
                                 interactive=True, buttons=["copy"])
         retr_btn = gr.Button("↻ Перевести заново (после правок слева)")
 
-        go_btn.click(process, [file_in, url_in, model_in, translate_in, clean_in],
-                     [ky_out, ru_out, status_out])
-        retr_btn.click(retranslate, [ky_out], [ru_out, status_out])
-        # при открытии/обновлении страницы подтянуть последний результат
-        app.load(latest_results, None, [ky_out, ru_out, status_out])
+        short_store = gr.BrowserState({"ky": "", "ru": ""})
+        go_btn.click(process_store, [file_in, url_in, model_in, translate_in, clean_in],
+                     [ky_out, ru_out, status_out, short_store])
+        retr_btn.click(retranslate_store, [ky_out], [ru_out, status_out, short_store])
+        # после обновления страницы вернуть СВОИ результаты (из этого браузера)
+        app.load(restore_short, [short_store], [ky_out, ru_out, status_out])
 
     with gr.Tab("Словарь терминов"):
         gr.Markdown("Глоссарий подставляется в каждый перевод. Добавляй новые термины — "
