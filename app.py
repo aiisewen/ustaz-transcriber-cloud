@@ -420,7 +420,7 @@ textarea, input[type="text"] { font-size: 16px !important; }
 """
 
 with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
-    gr.Markdown("# 🎙 Ustaz Transcriber <span style='font-size:0.5em; color:#888;'>made by Aisezim ✨</span>\nКыргызская речь → транскрипт → русский перевод")
+    gr.Markdown("# 🎙 Ustaz Transcriber\nКыргызская речь → транскрипт → русский перевод")
 
     with gr.Tab("Перевод"):
         with gr.Row(elem_classes="stack-mobile"):
