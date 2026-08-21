@@ -4,3 +4,4 @@ python-dotenv
 numpy
 imageio-ffmpeg
 yt-dlp
+python-docx

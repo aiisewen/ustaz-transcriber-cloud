@@ -74,6 +74,10 @@ def download_url(url: str) -> Path:
     if COOKIES.exists():
         cmd += ["--cookies", str(COOKIES)]
     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if res.returncode != 0 and "403" in (res.stderr or ""):
+        # YouTube иногда режет обычный клиент (403) — пробуем через android-клиент
+        retry = cmd[:3] + ["--extractor-args", "youtube:player_client=android"] + cmd[3:]
+        res = subprocess.run(retry, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if res.returncode != 0:
         tail = (res.stderr or "")[-400:]
         if "login" in tail.lower() or "cookies" in tail.lower() or "empty media response" in tail.lower():
@@ -374,6 +378,107 @@ def restore_short(store):
     return ky, ru, status
 
 
+# ---------- подкасты (длинные выступления) ----------
+
+def podcast_transcribe(file_path, url, progress=gr.Progress()):
+    """Этап 1: скачать/принять подкаст → рабочий транскрипт с таймкодами."""
+    ensure_dirs()
+    t0 = time.time()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    if file_path:
+        src = Path(file_path)
+    elif url and url.strip().startswith("http"):
+        try:
+            progress(0.02, desc="Скачиваю подкаст (может занять пару минут)…")
+            src = download_url(url)
+        except Exception as e:
+            return "", f"❌ {e}"
+    else:
+        return "", "Загрузи файл или вставь ссылку на YouTube."
+
+    try:
+        progress(0.1, desc="Извлекаю аудио…")
+        audio_file = extract_audio(src)
+        audio = load_audio(audio_file)
+        dur = int(len(audio) / 16000)
+
+        progress(0.3, desc=f"Распознаю в облаке ({dur//60} мин аудио — ElevenLabs)…")
+        ky_text = transcribe_cloud(audio_file)
+
+        t_path = unique_path(DIR_TRANSCRIPTS / f"{stamp}_подкаст_{src.stem}.txt")
+        t_path.write_text(ky_text, encoding="utf-8")
+        log_history({
+            "дата": stamp, "исходник": src.name, "длительность_сек": dur,
+            "модель": "подкаст-облако", "обработка_мин": f"{(time.time()-t0)/60:.1f}",
+            "транскрипт": t_path.name, "статус": "транскрипт готов",
+        })
+        mins = (time.time() - t0) / 60
+        return ky_text, (f"✅ Транскрипт готов за {mins:.1f} мин ({dur//60} мин аудио). "
+                         f"Вычитай кыргызский текст и жми «Сделать чистовик».")
+    except Exception as e:
+        return "", f"❌ Ошибка: {e}"
+
+
+def podcast_chistovik(ky_text, progress=gr.Progress()):
+    """Этап 2: вычитанный транскрипт → эталонный чистовик."""
+    from chistovik import make_chistovik
+    if not ky_text.strip():
+        return "", "Сначала нужен транскрипт (этап 1)."
+    t0 = time.time()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    def cb(i, n):
+        progress(0.05 + 0.9 * i / max(n, 1), desc=f"Перевожу в чистовик: часть {i+1} из {n}…")
+
+    try:
+        text = make_chistovik(claude, ky_text, glossary_as_text(), progress_cb=cb)
+    except anthropic.AuthenticationError:
+        return "", "⚠️ Ключ Claude не принят. Проверь ANTHROPIC_API_KEY."
+    except anthropic.RateLimitError:
+        return "", "⚠️ Claude перегружен — подожди минуту и нажми ещё раз."
+    except anthropic.APIStatusError as e:
+        msg = str(getattr(e, "message", "") or e).lower()
+        if "credit" in msg or "billing" in msg or "balance" in msg:
+            return "", ("⚠️ КРЕДИТЫ CLAUDE ЗАКОНЧИЛИСЬ. Пополни баланс на "
+                        "console.anthropic.com → Billing и нажми ещё раз.")
+        return "", f"⚠️ Ошибка Claude API: {e}"
+    except anthropic.APIConnectionError:
+        return "", "⚠️ Нет связи с Claude — нажми ещё раз."
+
+    out = unique_path(DIR_TRANSLATIONS / f"{stamp}_чистовик.txt")
+    out.write_text(text, encoding="utf-8")
+    mins = (time.time() - t0) / 60
+    return text, f"✅ Чистовик готов за {mins:.1f} мин."
+
+
+def podcast_docx(ru_text, title):
+    """Скачать чистовик как Word-файл в формате эталона."""
+    from chistovik import export_docx
+    if not ru_text.strip():
+        return None, "Сначала сделай чистовик."
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    safe = "".join(c for c in (title or "чистовик").strip() if c not in '\\/:*?"<>|') or "чистовик"
+    out = unique_path(DIR_TRANSLATIONS / f"{stamp}_{safe}.docx")
+    export_docx(ru_text, title.strip(), out)
+    return str(out), f"✅ Word-файл готов — кнопка скачивания ниже."
+
+
+def pod_tr_store(file_path, url, cur_ru, progress=gr.Progress()):
+    ky, status = podcast_transcribe(file_path, url, progress)
+    return ky, status, {"ky": ky, "ru": cur_ru}
+
+
+def pod_ch_store(ky_text, progress=gr.Progress()):
+    ru, status = podcast_chistovik(ky_text, progress)
+    return ru, status, {"ky": ky_text, "ru": ru}
+
+
+def restore_pod(store):
+    store = store or {}
+    return store.get("ky", ""), store.get("ru", "")
+
+
 def load_history_rows():
     if not HISTORY.exists():
         return []
@@ -422,7 +527,7 @@ textarea, input[type="text"] { font-size: 16px !important; }
 with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
     gr.Markdown("# 🎙 Ustaz Transcriber\nКыргызская речь → транскрипт → русский перевод")
 
-    with gr.Tab("Перевод"):
+    with gr.Tab("🎬 Короткие ролики"):
         with gr.Row(elem_classes="stack-mobile"):
             file_in = gr.File(label="Видео/аудио файл (mp4, mp3, m4a…)", type="filepath")
             with gr.Column():
@@ -447,6 +552,35 @@ with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
         retr_btn.click(retranslate_store, [ky_out], [ru_out, status_out, short_store])
         # после обновления страницы вернуть СВОИ результаты (из этого браузера)
         app.load(restore_short, [short_store], [ky_out, ru_out, status_out])
+
+    with gr.Tab("🎙️ Подкасты"):
+        gr.Markdown("**Длинные выступления (YouTube, 20–30 мин).** Два этапа: "
+                    "1) транскрипт с таймкодами — вычитываешь кыргызский; "
+                    "2) чистовик — эталонный литературный перевод. "
+                    "Потом можно скачать готовый Word-файл.")
+        with gr.Row(elem_classes="stack-mobile"):
+            pod_file = gr.File(label="Видео/аудио файл подкаста", type="filepath")
+            pod_url = gr.Textbox(label="…или ссылка на YouTube",
+                                 placeholder="https://www.youtube.com/watch?v=…")
+        pod_tr_btn = gr.Button("1️⃣ Транскрибировать", variant="primary")
+        pod_status = gr.Markdown()
+        pod_ky = gr.Textbox(label="Кыргызский транскрипт с таймкодами (вычитай перед чистовиком)",
+                            lines=20, interactive=True, buttons=["copy"])
+        pod_ch_btn = gr.Button("2️⃣ Сделать чистовик (эталонный перевод)", variant="primary")
+        pod_ru = gr.Textbox(label="Чистовик — русский литературный перевод (можно править)",
+                            lines=20, interactive=True, buttons=["copy"])
+        with gr.Row(elem_classes="stack-mobile"):
+            pod_title = gr.Textbox(label="Название для Word-файла",
+                                   placeholder="Например: Свадебное угощение")
+            pod_docx_btn = gr.Button("💾 Сохранить Word (.docx)")
+        pod_docx_file = gr.File(label="Скачать готовый файл", interactive=False)
+
+        pod_store = gr.BrowserState({"ky": "", "ru": ""})
+        pod_tr_btn.click(pod_tr_store, [pod_file, pod_url, pod_ru],
+                         [pod_ky, pod_status, pod_store])
+        pod_ch_btn.click(pod_ch_store, [pod_ky], [pod_ru, pod_status, pod_store])
+        pod_docx_btn.click(podcast_docx, [pod_ru, pod_title], [pod_docx_file, pod_status])
+        app.load(restore_pod, [pod_store], [pod_ky, pod_ru])
 
     with gr.Tab("Словарь терминов"):
         gr.Markdown("Глоссарий подставляется в каждый перевод. Добавляй новые термины — "
