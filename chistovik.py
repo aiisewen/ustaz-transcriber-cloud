@@ -99,8 +99,12 @@ def split_chunks(text: str) -> list[str]:
 
 
 def make_chistovik(client: anthropic.Anthropic, kyrgyz_text: str, glossary: str,
-                   progress_cb=None) -> str:
-    """Перевести длинный транскрипт в эталонный чистовик (кусками, связно)."""
+                   progress_cb=None, economy: bool = True) -> str:
+    """Перевести длинный транскрипт в эталонный чистовик (кусками, связно).
+
+    economy=True — Sonnet (в ~5 раз дешевле, чуть проще стиль);
+    economy=False — Opus (максимальное качество).
+    """
     chunks = split_chunks(kyrgyz_text)
     system = CHISTOVIK_SYSTEM.format(glossary=glossary)
     done: list[str] = []
@@ -115,8 +119,11 @@ def make_chistovik(client: anthropic.Anthropic, kyrgyz_text: str, glossary: str,
         else:
             user = f"Переведи в чистовик этот фрагмент транскрипта (начало выступления):\n\n{chunk}"
         resp = None
-        # 3 попытки Opus; если он перегружен — четвёртая на Sonnet, чтобы не терять весь перевод
-        attempts = ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"]
+        # экономный режим — Sonnet; максимум — Opus с запасной попыткой на Sonnet
+        if economy:
+            attempts = ["claude-sonnet-5"] * 4
+        else:
+            attempts = ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"]
         for attempt, model in enumerate(attempts):
             try:
                 resp = client.messages.create(

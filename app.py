@@ -11,9 +11,11 @@ Ustaz Transcriber — веб-интерфейс (Gradio).
 """
 
 import csv
+import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -108,6 +110,41 @@ def download_url(url: str) -> Path:
     raise RuntimeError("Не смогла надёжно определить скачанный файл — попробуй загрузить файлом.")
 
 
+def audio_duration_sec(path: Path) -> int:
+    """Длительность аудио без загрузки файла в память (важно для длинных подкастов)."""
+    import re as _re
+    import subprocess
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    res = subprocess.run([ffmpeg, "-i", str(path)], capture_output=True, text=True, errors="replace")
+    m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+)", res.stderr or "")
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    return 0
+
+
+def shrink_for_cloud(path: Path) -> Path:
+    """Сжать аудио перед отправкой в облако: моно 32 кбит/с.
+
+    Для распознавания речи качества хватает, а часовой файл худеет с ~90МБ
+    до ~25МБ — загрузка быстрее, память не пробивается, таймауты не ловим.
+    """
+    try:
+        if path.stat().st_size < 25 * 1024 * 1024:
+            return path
+        import subprocess
+        import imageio_ffmpeg
+        out = path.with_name(path.stem + "_small.mp3")
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        res = subprocess.run([ffmpeg, "-y", "-i", str(path), "-ac", "1", "-b:a", "32k", str(out)],
+                             capture_output=True, text=True, errors="replace")
+        if res.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+    except Exception:
+        pass
+    return path
+
+
 # ---------- словарь ----------
 
 def load_glossary_rows():
@@ -193,26 +230,34 @@ TRANSLATE_SYSTEM = """Ты переводчик религиозных выст�
 
 
 def translate_text(kyrgyz_text: str) -> str:
-    try:
-        resp = claude.messages.create(
-            model="claude-opus-5",
-            max_tokens=4000,
-            system=TRANSLATE_SYSTEM.format(glossary=glossary_as_text()),
-            messages=[{"role": "user", "content": kyrgyz_text}],
-        )
-    except anthropic.AuthenticationError:
-        return ("⚠️ Ключ Claude не принят (неверный или отозван). "
-                "Проверь ANTHROPIC_API_KEY в файле .env")
-    except anthropic.RateLimitError:
-        return "⚠️ Claude перегружен запросами — подожди минуту и нажми «Перевести заново»."
-    except anthropic.APIStatusError as e:
-        msg = str(getattr(e, "message", "") or e).lower()
-        if "credit" in msg or "billing" in msg or "balance" in msg:
-            return ("⚠️ КРЕДИТЫ CLAUDE ЗАКОНЧИЛИСЬ. Пополни баланс на "
-                    "console.anthropic.com → Billing, потом нажми «Перевести заново».")
-        return f"⚠️ Ошибка Claude API: {e}"
-    except anthropic.APIConnectionError:
-        return "⚠️ Нет связи с Claude — проверь интернет и нажми «Перевести заново»."
+    # 3 попытки Opus; если он перегружен — четвёртая на Sonnet, чтобы перевод не падал
+    attempts = ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"]
+    resp = None
+    for attempt, model in enumerate(attempts):
+        last = attempt == len(attempts) - 1
+        try:
+            resp = claude.messages.create(
+                model=model,
+                max_tokens=16000,  # хватает и на длинный ролик — перевод не обрезается
+                system=TRANSLATE_SYSTEM.format(glossary=glossary_as_text()),
+                messages=[{"role": "user", "content": kyrgyz_text}],
+            )
+            break
+        except anthropic.AuthenticationError:
+            return ("⚠️ Ключ Claude не принят (неверный или отозван). "
+                    "Проверь ANTHROPIC_API_KEY в файле .env")
+        except anthropic.APIConnectionError:
+            if last:
+                return "⚠️ Нет связи с Claude — проверь интернет и нажми «Перевести заново»."
+        except anthropic.APIStatusError as e:
+            msg = str(getattr(e, "message", "") or e).lower()
+            if "credit" in msg or "billing" in msg or "balance" in msg:
+                return ("⚠️ КРЕДИТЫ CLAUDE ЗАКОНЧИЛИСЬ. Пополни баланс на "
+                        "console.anthropic.com → Billing, потом нажми «Перевести заново».")
+            # 429/5xx/529 — временная перегрузка: ждём и повторяем
+            if last or e.status_code not in (429, 500, 502, 503, 504, 529):
+                return f"⚠️ Ошибка Claude API: {e}"
+        time.sleep(15 * (attempt + 1))
     if resp.stop_reason == "refusal":
         return "[Перевод отклонён моделью — переведи вручную]"
     return "".join(b.text for b in resp.content if b.type == "text")
@@ -228,6 +273,7 @@ def transcribe_cloud(audio_path: Path) -> str:
     if not key:
         raise RuntimeError("Нет ELEVENLABS_API_KEY в .env — облачный режим недоступен.")
     boundary = "----ustazboundary"
+    audio_path = shrink_for_cloud(audio_path)
     data = audio_path.read_bytes()
 
     def part(name, value):
@@ -243,7 +289,7 @@ def transcribe_cloud(audio_path: Path) -> str:
         headers={"xi-api-key": key,
                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        resp = _json.loads(urllib.request.urlopen(req, timeout=600).read())
+        resp = _json.loads(urllib.request.urlopen(req, timeout=3600).read())
     except urllib.error.HTTPError as e:
         detail = ""
         try:
@@ -318,15 +364,9 @@ def process(file_path, url, model_key, do_translate, do_clean=False, progress=gr
         if do_clean:
             progress(0.08, desc="Убираю фоновую музыку/шум (Demucs, несколько минут)…")
             audio_file = clean_vocals(audio_file)
-        audio = load_audio(audio_file)
-        dur = int(len(audio) / 16000)
-
-        if model_key == "облако":
-            progress(0.15, desc="Распознаю в облаке (ElevenLabs, секунды)…")
-            ky_text = transcribe_cloud(audio_file)
-        else:
-            progress(0.15, desc=f"Распознаю речь ({dur} сек аудио, несколько минут)…")
-            ky_text = transcribe_audio(audio, model_key)
+        dur = audio_duration_sec(audio_file)
+        progress(0.15, desc="Распознаю в облаке (ElevenLabs, секунды)…")
+        ky_text = transcribe_cloud(audio_file)
 
         # сохранить транскрипт
         t_path = unique_path(DIR_TRANSCRIPTS / f"{stamp}_{src.stem}.txt")
@@ -360,22 +400,59 @@ def retranslate(ky_text):
     return ru, "Перевод обновлён ✅"
 
 
-def process_store(file_path, url, model_key, do_translate, do_clean=False, progress=gr.Progress()):
+# у каждого браузера своя метка (cid); результат дублируется в файл на сервере —
+# если связь оборвалась посреди обработки, после обновления страницы он вернётся
+RESULTS_DIR = BASE / "results"
+
+
+def _save_result(cid, kind, ky, ru):
+    if not cid or not (ky or ru):
+        return
+    try:
+        RESULTS_DIR.mkdir(exist_ok=True)
+        (RESULTS_DIR / f"{cid}_{kind}.json").write_text(
+            json.dumps({"ky": ky, "ru": ru}, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_result(cid, kind):
+    try:
+        p = RESULTS_DIR / f"{cid}_{kind}.json"
+        if cid and p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def _cid(store):
+    return (store or {}).get("cid") or uuid.uuid4().hex
+
+
+def process_store(file_path, url, model_key, do_translate, do_clean, store,
+                  progress=gr.Progress()):
+    cid = _cid(store)
     ky, ru, status = process(file_path, url, model_key, do_translate, do_clean, progress)
-    return ky, ru, status, {"ky": ky, "ru": ru}
+    _save_result(cid, "short", ky, ru)
+    return ky, ru, status, {"cid": cid, "ky": ky, "ru": ru}
 
 
-def retranslate_store(ky_text):
+def retranslate_store(ky_text, store):
+    cid = _cid(store)
     ru, status = retranslate(ky_text)
-    return ru, status, {"ky": ky_text, "ru": ru}
+    _save_result(cid, "short", ky_text, ru)
+    return ru, status, {"cid": cid, "ky": ky_text, "ru": ru}
 
 
 def restore_short(store):
-    """Результат живёт в браузере: после обновления — на месте, у нового посетителя пусто."""
     store = store or {}
-    ky, ru = store.get("ky", ""), store.get("ru", "")
+    cid = _cid(store)
+    saved = _load_result(cid, "short") or {}
+    ky = saved.get("ky") or store.get("ky", "")
+    ru = saved.get("ru") or store.get("ru", "")
     status = "↺ Восстановлено после обновления страницы" if (ky or ru) else ""
-    return ky, ru, status
+    return ky, ru, status, {"cid": cid, "ky": ky, "ru": ru}
 
 
 # ---------- подкасты (длинные выступления) ----------
@@ -400,8 +477,7 @@ def podcast_transcribe(file_path, url, progress=gr.Progress()):
     try:
         progress(0.1, desc="Извлекаю аудио…")
         audio_file = extract_audio(src)
-        audio = load_audio(audio_file)
-        dur = int(len(audio) / 16000)
+        dur = audio_duration_sec(audio_file)
 
         progress(0.3, desc=f"Распознаю в облаке ({dur//60} мин аудио — ElevenLabs)…")
         ky_text = transcribe_cloud(audio_file)
@@ -420,7 +496,7 @@ def podcast_transcribe(file_path, url, progress=gr.Progress()):
         return "", f"❌ Ошибка: {e}"
 
 
-def podcast_chistovik(ky_text, progress=gr.Progress()):
+def podcast_chistovik(ky_text, quality="экономный", progress=gr.Progress()):
     """Этап 2: вычитанный транскрипт → эталонный чистовик."""
     from chistovik import make_chistovik
     if not ky_text.strip():
@@ -432,7 +508,8 @@ def podcast_chistovik(ky_text, progress=gr.Progress()):
         progress(0.05 + 0.9 * i / max(n, 1), desc=f"Перевожу в чистовик: часть {i+1} из {n}…")
 
     try:
-        text = make_chistovik(claude, ky_text, glossary_as_text(), progress_cb=cb)
+        text = make_chistovik(claude, ky_text, glossary_as_text(), progress_cb=cb,
+                              economy=(quality != "максимум"))
     except anthropic.AuthenticationError:
         return "", "⚠️ Ключ Claude не принят. Проверь ANTHROPIC_API_KEY."
     except anthropic.RateLimitError:
@@ -464,19 +541,27 @@ def podcast_docx(ru_text, title):
     return str(out), f"✅ Word-файл готов — кнопка скачивания ниже."
 
 
-def pod_tr_store(file_path, url, cur_ru, progress=gr.Progress()):
+def pod_tr_store(file_path, url, cur_ru, store, progress=gr.Progress()):
+    cid = _cid(store)
     ky, status = podcast_transcribe(file_path, url, progress)
-    return ky, status, {"ky": ky, "ru": cur_ru}
+    _save_result(cid, "pod", ky, cur_ru)
+    return ky, status, {"cid": cid, "ky": ky, "ru": cur_ru}
 
 
-def pod_ch_store(ky_text, progress=gr.Progress()):
-    ru, status = podcast_chistovik(ky_text, progress)
-    return ru, status, {"ky": ky_text, "ru": ru}
+def pod_ch_store(ky_text, quality, store, progress=gr.Progress()):
+    cid = _cid(store)
+    ru, status = podcast_chistovik(ky_text, quality, progress)
+    _save_result(cid, "pod", ky_text, ru)
+    return ru, status, {"cid": cid, "ky": ky_text, "ru": ru}
 
 
 def restore_pod(store):
     store = store or {}
-    return store.get("ky", ""), store.get("ru", "")
+    cid = _cid(store)
+    saved = _load_result(cid, "pod") or {}
+    ky = saved.get("ky") or store.get("ky", "")
+    ru = saved.get("ru") or store.get("ru", "")
+    return ky, ru, {"cid": cid, "ky": ky, "ru": ru}
 
 
 def load_history_rows():
@@ -546,12 +631,14 @@ with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
                                 interactive=True, buttons=["copy"])
         retr_btn = gr.Button("↻ Перевести заново (после правок слева)")
 
-        short_store = gr.BrowserState({"ky": "", "ru": ""})
-        go_btn.click(process_store, [file_in, url_in, model_in, translate_in, clean_in],
+        short_store = gr.BrowserState({"cid": "", "ky": "", "ru": ""})
+        go_btn.click(process_store,
+                     [file_in, url_in, model_in, translate_in, clean_in, short_store],
                      [ky_out, ru_out, status_out, short_store])
-        retr_btn.click(retranslate_store, [ky_out], [ru_out, status_out, short_store])
-        # после обновления страницы вернуть СВОИ результаты (из этого браузера)
-        app.load(restore_short, [short_store], [ky_out, ru_out, status_out])
+        retr_btn.click(retranslate_store, [ky_out, short_store],
+                       [ru_out, status_out, short_store])
+        # после обновления страницы вернуть СВОИ результаты (даже если связь обрывалась)
+        app.load(restore_short, [short_store], [ky_out, ru_out, status_out, short_store])
 
     with gr.Tab("🎙️ Подкасты"):
         gr.Markdown("**Длинные выступления (YouTube, 20–30 мин).** Два этапа: "
@@ -566,6 +653,10 @@ with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
         pod_status = gr.Markdown()
         pod_ky = gr.Textbox(label="Кыргызский транскрипт с таймкодами (вычитай перед чистовиком)",
                             lines=20, interactive=True, buttons=["copy"])
+        pod_quality = gr.Radio(["экономный", "максимум"], value="экономный",
+                               label="Качество перевода чистовика",
+                               info="экономный (Sonnet) — в ~5 раз дешевле; "
+                                    "максимум (Opus) — чуть тоньше стиль")
         pod_ch_btn = gr.Button("2️⃣ Сделать чистовик (эталонный перевод)", variant="primary")
         pod_ru = gr.Textbox(label="Чистовик — русский литературный перевод (можно править)",
                             lines=20, interactive=True, buttons=["copy"])
@@ -575,12 +666,13 @@ with gr.Blocks(title="Ustaz Transcriber", css=MOBILE_CSS) as app:
             pod_docx_btn = gr.Button("💾 Сохранить Word (.docx)")
         pod_docx_file = gr.File(label="Скачать готовый файл", interactive=False)
 
-        pod_store = gr.BrowserState({"ky": "", "ru": ""})
-        pod_tr_btn.click(pod_tr_store, [pod_file, pod_url, pod_ru],
+        pod_store = gr.BrowserState({"cid": "", "ky": "", "ru": ""})
+        pod_tr_btn.click(pod_tr_store, [pod_file, pod_url, pod_ru, pod_store],
                          [pod_ky, pod_status, pod_store])
-        pod_ch_btn.click(pod_ch_store, [pod_ky], [pod_ru, pod_status, pod_store])
+        pod_ch_btn.click(pod_ch_store, [pod_ky, pod_quality, pod_store],
+                         [pod_ru, pod_status, pod_store])
         pod_docx_btn.click(podcast_docx, [pod_ru, pod_title], [pod_docx_file, pod_status])
-        app.load(restore_pod, [pod_store], [pod_ky, pod_ru])
+        app.load(restore_pod, [pod_store], [pod_ky, pod_ru, pod_store])
 
     with gr.Tab("Словарь терминов"):
         gr.Markdown("Глоссарий подставляется в каждый перевод. Добавляй новые термины — "
